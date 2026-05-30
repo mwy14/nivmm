@@ -28,7 +28,7 @@ type KvmUserspaceMemoryRegion {.packed.} = object # needs to exactly match the c
   memory_size: uint64
   userspace_addr: uint64
 
-type KvmRun {.packed.} = object
+type KvmRunState {.packed.} = object
   request_interrupt_window: uint8
   immediate_exit: uint8
   padding1: array[6, uint8]
@@ -72,6 +72,7 @@ const
   KVM_GET_VCPU_MMAP_SIZE = kvm_io(0x04)
   KVM_CREATE_VCPU = kvm_io(0x41)
   KVM_SET_USER_MEMORY_REGION = kvm_iow(0x46, 32)
+  KVM_RUN = kvm_io(0x80)
   KVM_SET_REGS = kvm_iow(0x82, sizeof(KvmRegs).culong)
   KVM_GET_SREGS = kvm_ior(0x83, sizeof(KvmSregs).culong)
   KVM_SET_SREGS = kvm_iow(0x84, sizeof(KvmSregs).culong)
@@ -107,7 +108,7 @@ proc main() =
     memory_size: GUEST_MEM_SIZE.uint64,
     userspace_addr: cast[uint64](guest_mem)
   )
-  if ioxctl(vmFd, KVM_SET_USER_MEMORY_REGION, addr region) < 0:
+  if ioxctl(vm_fd, KVM_SET_USER_MEMORY_REGION, addr region) < 0:
     echo "KVM_SET_USER_MEMORY_REGION: ", strerror(errno)
     quit(1)
 
@@ -133,8 +134,39 @@ proc main() =
   echo "sizeof KvmSregs: ", sizeof(KvmSregs)
   echo "sizeof KvmRegs:  ", sizeof(KvmRegs)
 
-  let kvm_run = cast[ptr KvmRun](raw_kr)
-  echo kvm_run.exit_reason
+  let code = cast[ptr UncheckedArray[uint8]](guest_mem)
+
+  code[0] = 0xF4'u8
+  echo "wrote HLT instruct to guest mem"
+
+  var regs: KvmRegs
+  var sregs: KvmSregs
+
+
+  if ioxctl(vcpu_fd, KVM_GET_SREGS, addr sregs) < 0:
+    echo "KVM_GET_SREGS: ", strerror(errno)
+    quit(1)
+
+  sregs.cs.base = 0
+  sregs.cs.selector = 0
+
+  if ioxctl(vcpu_fd, KVM_SET_SREGS, addr sregs) < 0:
+    echo "KVM_SET_SREGS: ", strerror(errno)
+    quit(1)
+
+  regs.rip = 0
+  regs.rflags = 2
+
+  if ioxctl(vcpu_fd, KVM_SET_REGS, addr regs) < 0:
+    echo "KVM_SET_REGS: ", strerror(errno)
+    quit(1)
+
+  if ioctl(vcpu_fd, KVM_RUN) < 0:
+    echo "KVM_RUN: ", strerror(errno)
+    quit(1)
+
+  let kvm_runner = cast[ptr KvmRunState](raw_kr)
+  echo kvm_runner.exit_reason
 
   discard posix.munmap(guest_mem, GUEST_MEM_SIZE)
   discard posix.munmap(raw_kr, mmap_size)
