@@ -4,7 +4,9 @@ const
   KVM_IO_MAGIC_BYTE: culong = 0xAE
   KVM_NR_INTERRUPTS = 256
   GUEST_MEM_SIZE = 2 * 1024 * 1024
-  KVM_CMD_HLT: uint32 = 5
+  KVM_EXIT_IO_OUT: uint32 = 1
+  KVM_EXIT_IO: uint32 = 2
+  KVM_EXIT_HLT: uint32 = 5
 
 proc ioctl(fd: cint, request: culong, arg: culong = 0): cint
   {.importc, varargs, header: "<sys/ioctl.h>".}
@@ -148,8 +150,17 @@ proc main() =
 
   let code = cast[ptr UncheckedArray[uint8]](guest_mem)
 
-  code[0] = 0xF4'u8
-  echo "wrote HLT instruct to guest mem"
+  # code[0] = 0xF4'u8
+  # echo "wrote HLT instruct to guest mem"
+
+  code[0] = 0xBA'u8  # mov d - 0x3F8
+  code[1] = 0xF8'u8
+  code[2] = 0x03'u8
+  code[3] = 0xB0'u8  # mov al - 'H'
+  code[4] = 0x48'u8
+  code[5] = 0xEE'u8  # out dx - al
+  code[6] = 0xF4'u8  # hlt
+  echo "wrote code to write H to com 1 then halt"
 
   var regs: KvmRegs
   var sregs: KvmSregs
@@ -182,9 +193,13 @@ proc main() =
       echo "KVM_RUN: ", strerror(errno)
       quit(1)
     case kvm_runner.exit_reason:
-      of KVM_CMD_HLT:
+      of KVM_EXIT_HLT:
         echo "guest halted"
         break
+      of KVM_EXIT_IO:
+        if kvm_runner.io.port == 0x3F8'u16 and kvm_runner.io.direction == 1'u8: # 0x3F8 is io port
+          stdout.write(char(cast[ptr uint8](cast[uint64](raw_kr) + kvm_runner.io.data_offset)[]))
+          echo "" # adds newline to out
       else:
         echo "unhandled exit: ", kvm_runner.exit_reason
         break
