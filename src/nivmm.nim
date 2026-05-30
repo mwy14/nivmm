@@ -4,6 +4,7 @@ const
   KVM_IO_MAGIC_BYTE: culong = 0xAE
   KVM_NR_INTERRUPTS = 256
   GUEST_MEM_SIZE = 2 * 1024 * 1024
+  KVM_CMD_HLT: uint32 = 5
 
 proc ioctl(fd: cint, request: culong, arg: culong = 0): cint
   {.importc, varargs, header: "<sys/ioctl.h>".}
@@ -20,7 +21,6 @@ proc kvm_ior(nr: culong, size: culong): culong =
 proc kvm_iow(nr: culong, size: culong): culong =
   return (1.culong shl 30) or (size shl 16) or kvm_io(nr)
 
-
 type KvmUserspaceMemoryRegion {.packed.} = object # needs to exactly match the c array
   slot: uint32
   flags: uint32
@@ -28,11 +28,24 @@ type KvmUserspaceMemoryRegion {.packed.} = object # needs to exactly match the c
   memory_size: uint64
   userspace_addr: uint64
 
+type KvmRunIo {.packed.} = object
+  direction: uint8
+  size: uint8
+  port: uint16
+  count: uint32
+  data_offset: uint64
+
 type KvmRunState {.packed.} = object
   request_interrupt_window: uint8
   immediate_exit: uint8
   padding1: array[6, uint8]
   exit_reason: uint32
+  ready_for_interrupt_injection: uint8
+  if_flag: uint8
+  flags: uint16
+  cr8: uint64
+  apic_base: uint64
+  io: KvmRunIo
 
 type KvmRegs {.packed.} = object
   rax, rbx, rcx, rdx: uint64
@@ -66,7 +79,6 @@ type KvmSregs {.packed.} = object
 
 
 const
-
   KVM_GET_API_VERSION = kvm_io(0x00)
   KVM_CREATE_VM = kvm_io(0x01)
   KVM_GET_VCPU_MMAP_SIZE = kvm_io(0x04)
@@ -161,12 +173,21 @@ proc main() =
     echo "KVM_SET_REGS: ", strerror(errno)
     quit(1)
 
-  if ioctl(vcpu_fd, KVM_RUN) < 0:
-    echo "KVM_RUN: ", strerror(errno)
-    quit(1)
+  # let kvm_runner = cast[ptr KvmRunState](raw_kr)
+  # echo kvm_runner.exit_reason
 
   let kvm_runner = cast[ptr KvmRunState](raw_kr)
-  echo kvm_runner.exit_reason
+  while true:
+    if ioctl(vcpu_fd, KVM_RUN) < 0:
+      echo "KVM_RUN: ", strerror(errno)
+      quit(1)
+    case kvm_runner.exit_reason:
+      of KVM_CMD_HLT:
+        echo "guest halted"
+        break
+      else:
+        echo "unhandled exit: ", kvm_runner.exit_reason
+        break
 
   discard posix.munmap(guest_mem, GUEST_MEM_SIZE)
   discard posix.munmap(raw_kr, mmap_size)
