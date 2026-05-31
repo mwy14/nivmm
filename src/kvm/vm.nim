@@ -87,6 +87,7 @@ type Vm* = ref object
   guest_mem_size: int
   raw_kr: pointer
   mmap_size: cint
+  uart_lcr: uint8
 
 const
   KVM_GET_API_VERSION = kvm_io(0x00)
@@ -146,9 +147,29 @@ proc run*(vm: Vm) =
         echo "guest halted"
         break
       of KVM_EXIT_IO:
-        if kvm_runner.io.port == 0x3F8'u16 and kvm_runner.io.direction == 1'u8: # 0x3F8 is io port
-          stdout.write(char(cast[ptr uint8](cast[uint64](vm.raw_kr) + kvm_runner.io.data_offset)[]))
-          echo "" # adds newline to out
+        case kvm_runner.io.direction:
+          of 0'u8: #guest read
+            let data_ptr = cast[ptr uint8](cast[uint64](vm.raw_kr) + kvm_runner.io.data_offset)
+            data_ptr[] = case kvm_runner.io.port
+              of 0x3FD'u16: 0x60'u8 # write 0x60 to data_offest
+              of 0x3FA'u16: 0xC1'u8 # write 0xC1 to data_offset
+              else: 0x00'u8 # ingore, do not write
+            continue
+          of 1'u8: #guest write
+            let data = cast[ptr uint8](cast[uint64](vm.raw_kr) + kvm_runner.io.data_offset)[]
+            case kvm_runner.io.port
+              of 0x3F8: # print byte stored
+                if (vm.uart_lcr and 0x80'u8) == 0:
+                  stdout.write(char(data))
+                  echo ""
+              of 0x3FB: # write byte to local uart lcr ref
+                vm.uart_lcr = data
+              else:
+                echo "unknown port: ", kvm_runner.io.port
+                discard
+          else:
+            echo "unknown direction: ", kvm_runner.io.direction
+            continue
       else:
         echo "unhandled exit: ", kvm_runner.exit_reason
         break
