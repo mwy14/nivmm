@@ -136,6 +136,12 @@ proc loadCode*(vm: Vm, code: openArray[uint8]) =
   for i, byte in code:
     guest_mem_access[i] = byte
 
+proc strToCode*(msg: string): seq[uint8] =
+  result = @[0xBA'u8, 0xF8, 0x03] # mov dx - 0x3F8
+  for c in msg:
+    result.add(@[0xB0'u8, uint8(c), 0xEE])
+  result.add(0xF4'u8) #hlt byte
+
 proc run*(vm: Vm) =
   let kvm_runner = cast[ptr KvmRunState](vm.raw_kr)
   while true:
@@ -161,7 +167,6 @@ proc run*(vm: Vm) =
               of 0x3F8: # print byte stored
                 if (vm.uart_lcr and 0x80'u8) == 0:
                   stdout.write(char(data))
-                  echo ""
               of 0x3FB: # write byte to local uart lcr ref
                 vm.uart_lcr = data
               else:
