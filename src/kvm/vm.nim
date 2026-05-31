@@ -3,7 +3,7 @@ import posix
 const
   KVM_IO_MAGIC_BYTE: culong = 0xAE
   KVM_NR_INTERRUPTS = 256
-  GUEST_MEM_SIZE = 2 * 1024 * 1024
+  GUEST_MEM_SIZE = 128 * 1024 * 1024 #128MB
   KVM_EXIT_IO_OUT: uint32 = 1
   KVM_EXIT_IO: uint32 = 2
   KVM_EXIT_HLT: uint32 = 5
@@ -141,6 +141,35 @@ proc strToCode*(msg: string): seq[uint8] =
   for c in msg:
     result.add(@[0xB0'u8, uint8(c), 0xEE])
   result.add(0xF4'u8) #hlt byte
+
+proc loadKernel*(vm: Vm, path: string) =
+  let data = readFile(path)
+  let setup_sects = uint8(data[0x1F1])
+  let kernel_offset = (setup_sects + 1) * 512
+  echo "kernel starts at byte: ", kernel_offset
+
+  let data_ptr = cast[ptr uint8](cast[uint64](vm.guest_mem) + 0x100000)
+  let kernel_ptr = unsafeAddr(data[kernel_offset])
+  let kernel_size = data.len - int(kernel_offset)
+
+  copyMem(data_ptr, kernel_ptr, kernel_size)
+
+  let source = "console=ttyS0 noapic nokaslr\0"
+  let src_ptr = unsafeAddr(source[0])
+  let cmd_ptr = cast[ptr uint8](cast[uint64](vm.guest_mem) + 0x20000)
+  let cmd_size = source.len
+
+  copyMem(cmd_ptr, src_ptr, cmd_size)
+
+  let boot_params_ptr = cast[ptr uint8](cast[uint64](vm.guest_mem) + 0x10000)
+  let boot_params = cast[ptr UncheckedArray[uint8]](boot_params_ptr)
+  zeroMem(boot_params_ptr, 4096) # clear page
+  copyMem(addr boot_params[0x1F1], unsafeAddr(data[0x1F1]), 128)
+
+  boot_params[0x210] = 0xFF'u8 # type of loader
+  boot_params[0x211] = 0x81'u8 # load flags
+  cast[ptr uint16](addr boot_params[0x222])[] = 0xFE00'u16  # heap end ptr
+  cast[ptr uint32](addr boot_params[0x226])[] = 0x20000'u32 # cmd line ptr
 
 proc run*(vm: Vm) =
   let kvm_runner = cast[ptr KvmRunState](vm.raw_kr)
