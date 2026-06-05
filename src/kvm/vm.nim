@@ -7,6 +7,7 @@ const
   KVM_EXIT_IO_OUT: uint32 = 1
   KVM_EXIT_IO: uint32 = 2
   KVM_EXIT_HLT: uint32 = 5
+  KVM_EXIT_MMIO: uint32 = 6
 
 proc ioctl(fd: cint, request: culong, arg: culong = 0): cint
   {.importc, varargs, header: "<sys/ioctl.h>".}
@@ -22,6 +23,9 @@ proc kvm_ior(nr: culong, size: culong): culong =
 
 proc kvm_iow(nr: culong, size: culong): culong =
   return (1.culong shl 30) or (size shl 16) or kvm_io(nr)
+
+proc kvm_iowr(nr: culong, size: culong): culong =
+  return (3.culong shl 30) or (size shl 16) or kvm_io(nr)
 
 type KvmUserspaceMemoryRegion {.packed.} = object # needs to exactly match the c array
   slot: uint32
@@ -79,6 +83,16 @@ type KvmSregs {.packed.} = object
   apic_base: uint64
   interrupt_bitmap: array[(KVM_NR_INTERRUPTS + 63) div 64, uint64]
 
+type KvmCpuIdEntry {.packed.} = object
+  function, index, flags: uint32
+  eax, ebx, ecx, edx: uint32
+  padding: array[3, uint32]
+
+type KvmCpuId2 {.packed.} = object
+  nent, padding: uint32
+  entries: array[100, KvmCpuIdEntry]
+
+
 type Vm* = ref object
   kvm_fd: cint
   vm_fd: cint
@@ -93,12 +107,14 @@ const
   KVM_GET_API_VERSION = kvm_io(0x00)
   KVM_CREATE_VM = kvm_io(0x01)
   KVM_GET_VCPU_MMAP_SIZE = kvm_io(0x04)
+  KVM_GET_SUPPORTED_CPUID = kvm_iowr(0x05, 8)
   KVM_CREATE_VCPU = kvm_io(0x41)
   KVM_SET_USER_MEMORY_REGION = kvm_iow(0x46, 32)
   KVM_RUN = kvm_io(0x80)
   KVM_SET_REGS = kvm_iow(0x82, sizeof(KvmRegs).culong)
   KVM_GET_SREGS = kvm_ior(0x83, sizeof(KvmSregs).culong)
   KVM_SET_SREGS = kvm_iow(0x84, sizeof(KvmSregs).culong)
+  KVM_SET_CPUID2 = kvm_iow(0x90, 8)
 
 proc setupMem(vm: Vm) =
   var region = KvmUserspaceMemoryRegion(
@@ -113,22 +129,78 @@ proc setupMem(vm: Vm) =
     quit(1)
 
 proc setupRegs*(vm: Vm) =
+  let gdt = [
+    0x0000000000000000'u64,  # null
+    0x00CF9A000000FFFF'u64,  # flat code, selector = 0x08
+    0x00CF92000000FFFF'u64,  # flat data, selector = 0x10
+  ]
+
+  let guest_ptr_gdt = cast[ptr uint8](cast[uint64](vm.guest_mem) + 0x500)
+  let gdt_ptr = addr(gdt[0])
+  let gdt_size = sizeof(gdt)
+
+  let data_segment = KvmSegment(
+      base: 0,
+      limit: 0xFFFFFFFF'u32,
+      selector: 0x10, # gdt entry 1
+      seg_type: 0x2,
+      db: 1, # 32 bit
+      g: 1, #4KB
+      s: 1,
+      present: 1,
+  )
+
   var regs: KvmRegs
   var sregs: KvmSregs
+
+  copyMem(guest_ptr_gdt, gdt_ptr, gdt_size)
+
   if ioxctl(vm.vcpu_fd, KVM_GET_SREGS, addr sregs) < 0:
     echo "KVM_GET_SREGS: ", strerror(errno)
     quit(1)
 
-  sregs.cs.base = 0
-  sregs.cs.selector = 0
+  sregs.gdt = KvmDtable(
+    base: 0x500,
+    limit: (gdt_size - 1).uint16
+  )
+  sregs.cr0 = sregs.cr0 or 1'u64
+  sregs.cs = KvmSegment(
+    base: 0,
+    limit: 0xFFFFFFFF'u32,
+    selector: 0x08, # gdt entry 1
+    seg_type: 0xA, # execute / read
+    db: 1, # 32 bit
+    g: 1, #4KB
+    s: 1,
+    present: 1,
+  )
+  sregs.ds = data_segment
+  sregs.es = data_segment
+  sregs.fs = data_segment
+  sregs.gs = data_segment
+  sregs.ss = data_segment
+
   if ioxctl(vm.vcpu_fd, KVM_SET_SREGS, addr sregs) < 0:
     echo "KVM_SET_SREGS: ", strerror(errno)
     quit(1)
 
-  regs.rip = 0
-  regs.rflags = 2
+  regs.rip = 0x100000 # kernel entry
+  regs.rsi = 0x10000 # boot params
+  regs.rflags = 0x2
+  regs.rsp = 0x8000'u64
+
   if ioxctl(vm.vcpu_fd, KVM_SET_REGS, addr regs) < 0:
     echo "KVM_SET_REGS: ", strerror(errno)
+    quit(1)
+
+proc setupCpuId*(vm: Vm) =
+  var cpuid: KvmCpuid2
+  cpuid.nent = 100
+  if ioxctl(vm.kvm_fd, KVM_GET_SUPPORTED_CPUID, addr cpuid) < 0:
+    echo "KVM_GET_SUPPORTED_CPUID: ", strerror(errno)
+    quit(1)
+  if ioxctl(vm.vcpu_fd, KVM_SET_CPUID2, addr cpuid) < 0:
+    echo "KVM_SET_CPUID2: ", strerror(errno)
     quit(1)
 
 proc loadCode*(vm: Vm, code: openArray[uint8]) =
@@ -154,7 +226,10 @@ proc loadKernel*(vm: Vm, path: string) =
 
   copyMem(data_ptr, kernel_ptr, kernel_size)
 
-  let source = "console=ttyS0 noapic nokaslr\0"
+  let check = cast[ptr UncheckedArray[uint8]](cast[uint64](vm.guest_mem) + 0x100000)
+  echo "first bytes at 0x100000: ", check[0].int, " ", check[1].int, " ", check[2].int
+
+  let source = "console=ttyS0 noapic nokaslr pci=off\0"
   let src_ptr = unsafeAddr(source[0])
   let cmd_ptr = cast[ptr uint8](cast[uint64](vm.guest_mem) + 0x20000)
   let cmd_size = source.len
@@ -166,10 +241,21 @@ proc loadKernel*(vm: Vm, path: string) =
   zeroMem(boot_params_ptr, 4096) # clear page
   copyMem(addr boot_params[0x1F1], unsafeAddr(data[0x1F1]), 128)
 
+  boot_params[0x1e8] = 2
   boot_params[0x210] = 0xFF'u8 # type of loader
   boot_params[0x211] = 0x81'u8 # load flags
   cast[ptr uint16](addr boot_params[0x222])[] = 0xFE00'u16  # heap end ptr
   cast[ptr uint32](addr boot_params[0x226])[] = 0x20000'u32 # cmd line ptr
+
+  cast[ptr uint64](addr boot_params[0x2d0])[] = 0x00000000'u64
+  cast[ptr uint64](addr boot_params[0x2d8])[] = 0x0009FC00'u64
+  cast[ptr uint32](addr boot_params[0x2e0])[] = 0x1
+
+  cast[ptr uint64](addr boot_params[0x2e4])[] = 0x00100000'u64
+  cast[ptr uint64](addr boot_params[0x2ec])[] = (GUEST_MEM_SIZE - 0x100000).uint64
+  cast[ptr uint32](addr boot_params[0x2f4])[] = 0x1
+
+
 
 proc run*(vm: Vm) =
   let kvm_runner = cast[ptr KvmRunState](vm.raw_kr)
@@ -188,22 +274,26 @@ proc run*(vm: Vm) =
             data_ptr[] = case kvm_runner.io.port
               of 0x3FD'u16: 0x60'u8 # write 0x60 to data_offest
               of 0x3FA'u16: 0xC1'u8 # write 0xC1 to data_offset
-              else: 0x00'u8 # ingore, do not write
+              else: 0xFF'u8 # no pci
             continue
           of 1'u8: #guest write
             let data = cast[ptr uint8](cast[uint64](vm.raw_kr) + kvm_runner.io.data_offset)[]
             case kvm_runner.io.port
               of 0x3F8: # print byte stored
+                echo "3F8 write, lcr=", vm.uart_lcr.int, " data=", data.int
                 if (vm.uart_lcr and 0x80'u8) == 0:
                   stdout.write(char(data))
+                  stdout.flushFile()
               of 0x3FB: # write byte to local uart lcr ref
                 vm.uart_lcr = data
               else:
-                echo "unknown port: ", kvm_runner.io.port
+                # echo "unknown port: ", kvm_runner.io.port
                 discard
           else:
             echo "unknown direction: ", kvm_runner.io.direction
             continue
+      of KVM_EXIT_MMIO:
+        continue
       else:
         echo "unhandled exit: ", kvm_runner.exit_reason
         break
